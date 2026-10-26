@@ -2,10 +2,12 @@
 // Tealium's in-memory profile models on window.gApp.
 //
 // An Event Spec is two linked Backbone models:
-//   eventDefinitionCollection  -> { tealiumEvent, eventAttributes[], linkedFilteredStreamId, ... }
-//   filteredStreamCollection   -> { name: "Event Specification: <event>", conditions, logic, ... }
+//   eventDefinitionCollection  -> { tealiumEvent, eventAttributes (collection), linkedFilteredStreamId, ... }
+//   filteredStreamCollection   -> { name: "Event Specification: <event>", conditions (model), logic, ... }
 // Both only reach Tealium's servers when the user clicks Save / Publish, so a
 // duplicate is made by adding cloned models and marking the profile dirty.
+// The clones must keep Tealium's own model/collection classes at every level:
+// its save path calls methods on them (e.g. eventAttributes.each, stream.hasQuantifier).
 (function () {
   'use strict';
 
@@ -18,11 +20,40 @@
     return { defs: im.eventDefinitionCollection, streams: im.filteredStreamCollection };
   }
 
-  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const isModel = (v) => v && typeof v === 'object' && 'attributes' in v && 'cid' in v && typeof v.get === 'function';
+  const isCollection = (v) => v && typeof v === 'object' && Array.isArray(v.models) && typeof v.each === 'function';
+
+  // Deep copy that rebuilds nested Backbone models/collections with their own classes.
+  function cloneValue(v) {
+    if (isCollection(v)) return new v.constructor(v.models.map((m) => cloneModel(m)));
+    if (isModel(v)) return cloneModel(v);
+    if (Array.isArray(v)) return v.map(cloneValue);
+    if (v && typeof v === 'object' && v.constructor === Object) {
+      const o = {};
+      for (const k in v) o[k] = cloneValue(v[k]);
+      return o;
+    }
+    return v;
+  }
+
+  function cloneAttributes(model) {
+    const a = {};
+    for (const k in model.attributes) a[k] = cloneValue(model.attributes[k]);
+    return a;
+  }
+
+  function cloneModel(model, overrides) {
+    return new model.constructor(Object.assign(cloneAttributes(model), overrides));
+  }
 
   // Rewrite every `tealium_event equals <old>` clause to point at the new event.
+  // Walks plain objects/arrays and (not-yet-added) Backbone models' attributes.
   function retarget(node, oldEvent, newEvent) {
-    if (Array.isArray(node)) {
+    if (isCollection(node)) {
+      node.models.forEach((m) => retarget(m, oldEvent, newEvent));
+    } else if (isModel(node)) {
+      retarget(node.attributes, oldEvent, newEvent);
+    } else if (Array.isArray(node)) {
       node.forEach((n) => retarget(n, oldEvent, newEvent));
     } else if (node && typeof node === 'object') {
       if (node.operand1 === TEALIUM_EVENT_OPERAND && node.operand2 === oldEvent) node.operand2 = newEvent;
@@ -56,31 +87,30 @@
 
     const src = m.defs.get(sourceId);
     if (!src) throw new Error('Source event spec not found.');
-    const def = clone(src.toJSON());
-    const oldEvent = def.tealiumEvent;
-
-    const srcStream = m.streams.get(def.linkedFilteredStreamId);
+    const oldEvent = src.get('tealiumEvent');
+    const srcStream = m.streams.get(src.get('linkedFilteredStreamId'));
     if (!srcStream) throw new Error(`Linked filtered stream for "${oldEvent}" not found.`);
-    const stream = clone(srcStream.toJSON());
 
     const now = new Date().toISOString();
-    const user = currentUser(def.updatedBy);
+    const user = currentUser(src.get('updatedBy'));
+    const stamps = { createdBy: user, updatedBy: user, creationDate: now, updatedDate: now };
     const newStreamId = window.gApp.utils.uuid();
 
-    stream.id = newStreamId;
-    stream.name = STREAM_NAME_PREFIX + newEvent;
-    retarget(stream.conditions, oldEvent, newEvent);
-    if (typeof stream.logic === 'string') {
-      const logic = JSON.parse(stream.logic);
+    const streamAttrs = cloneAttributes(srcStream);
+    retarget(streamAttrs.conditions, oldEvent, newEvent);
+    if (typeof streamAttrs.logic === 'string') {
+      const logic = JSON.parse(streamAttrs.logic);
       retarget(logic, oldEvent, newEvent);
-      stream.logic = JSON.stringify(logic);
+      streamAttrs.logic = JSON.stringify(logic);
     }
-    Object.assign(stream, { createdBy: user, updatedBy: user, creationDate: now, updatedDate: now });
+    Object.assign(streamAttrs, stamps, { id: newStreamId, name: STREAM_NAME_PREFIX + newEvent });
+    const stream = new srcStream.constructor(streamAttrs);
 
-    def.id = window.gApp.utils.uuid();
-    def.tealiumEvent = newEvent;
-    def.linkedFilteredStreamId = newStreamId;
-    Object.assign(def, { createdBy: user, updatedBy: user, creationDate: now, updatedDate: now });
+    const def = cloneModel(src, Object.assign({}, stamps, {
+      id: window.gApp.utils.uuid(),
+      tealiumEvent: newEvent,
+      linkedFilteredStreamId: newStreamId,
+    }));
 
     // Stream first: adding the definition fires Tealium's own listeners, which
     // expect the linked stream to exist.
@@ -88,7 +118,7 @@
     m.defs.add(def);
     window.gApp.utils.setDirty(true);
 
-    return { id: def.id, streamId: newStreamId, event: newEvent, attributes: def.eventAttributes.length };
+    return { id: def.id, streamId: newStreamId, event: newEvent, attributes: def.get('eventAttributes').length };
   }
 
   function findByEvent(event) {
