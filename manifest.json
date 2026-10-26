@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Tealium Event Spec Duplicator",
+  "version": "1.0.0",
+  "description": "Adds a Duplicate button to Tealium Event Specifications, copying a spec and all its attribute definitions under a new event name.",
+  "content_scripts": [
+    {
+      "matches": ["https://my.tealiumiq.com/tms*"],
+      "js": ["page.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}
